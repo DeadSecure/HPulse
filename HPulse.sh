@@ -18,7 +18,7 @@ SCRIPT_DIR="$(dirname "$TRUST_SCRIPT_PATH")"
 SETUP_MARKER_FILE="/var/lib/frpulse/.setup_complete" # Changed TrustTunnel to FRPulse
 
 # --- Script Version ---
-SCRIPT_VERSION="1.3.0" # Define the script version - UPDATED TO 1.3.0
+SCRIPT_VERSION="1.5.0" # Define the script version - UPDATED TO 1.5.0
 
 # --- Helper Functions ---
 
@@ -1124,8 +1124,8 @@ tls:
   network_protocol_choice=${network_protocol_choice:-3}
 
   local forward_ports_input
-  local udp_forwarding_config=""
-  local tcp_forwarding_config=""
+  local udp_forwarding_content="" # Changed to hold only entries
+  local tcp_forwarding_content="" # Changed to hold only entries
 
   while true; do
     echo -e "👉 ${WHITE}Enter forwarding ports separated by commas (e.g., 43070,53875):${RESET} "
@@ -1150,24 +1150,22 @@ tls:
   done
   echo ""
 
-  # Generate UDP forwarding config
+  # Generate UDP forwarding content (entries only)
   if [[ "$network_protocol_choice" == "1" || "$network_protocol_choice" == "3" ]]; then
-    udp_forwarding_config="udpForwarding:"
     IFS=',' read -ra ADDR <<< "$forward_ports_input"
     for p in "${ADDR[@]}"; do
-      udp_forwarding_config+="
+      udp_forwarding_content+="
   - listen: 0.0.0.0:$p
     remote: '[::]:$p'
     timeout: 20s"
     done
   fi
 
-  # Generate TCP forwarding config
+  # Generate TCP forwarding content (entries only)
   if [[ "$network_protocol_choice" == "2" || "$network_protocol_choice" == "3" ]]; then
-    tcp_forwarding_config="tcpForwarding:"
     IFS=',' read -ra ADDR <<< "$forward_ports_input"
     for p in "${ADDR[@]}"; do
-      tcp_forwarding_config+="
+      tcp_forwarding_content+="
   - listen: 0.0.0.0:$p
     remote: '[::]:$p'
     timeout: 20s"
@@ -1294,8 +1292,10 @@ auth: "$password" # Updated password format
 $tls_config
 $obfs_config
 ${masquerade_config} # Optional masquerade
-${udp_forwarding_config}
-${tcp_forwarding_config}
+
+$(if [[ -n "$udp_forwarding_content" ]]; then echo "udpForwarding:"; echo -e "$udp_forwarding_content"; echo ""; fi) # Always include header, add extra newline
+$(if [[ -n "$tcp_forwarding_content" ]]; then echo "tcpForwarding:"; echo -e "$tcp_forwarding_content"; fi) # Always include header
+
 ${quic_config} # Added QUIC parameters to client config
 EOF
   print_success "hysteria-client-${client_name}.yaml created successfully at $config_file_path"
@@ -1393,6 +1393,306 @@ speedtest_from_server_action() {
   echo ""
   echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
   read -p ""
+}
+
+# New helper function for appending to YAML blocks
+# This function is designed to append new entries to an existing YAML list block.
+# It uses awk to find the block and insert the new content with correct indentation.
+append_to_yaml_block() {
+  local config_file="$1"
+  local block_key="$2" # e.g., "udpForwarding" or "tcpForwarding"
+  local new_entry_content="$3" # The multi-line YAML entry to add (e.g., "  - listen:...\n    remote:...")
+
+  awk -v key="$block_key" -v entry="$new_entry_content" '
+    BEGIN { in_block = 0; inserted = 0 }
+    $0 ~ "^" key ":" { # Found the block header
+      print; # Print the header
+      in_block = 1;
+      next;
+    }
+    in_block && /^[[:space:]]{2}[^[:space:]]/ { # Found a line with less indentation (end of block, e.g., next top-level key)
+      if (!inserted) { # Only insert if not already inserted in this block
+        print entry;
+        inserted = 1;
+      }
+      print; # Print the current line (which is the start of the next block)
+      in_block = 0; # Exit the block
+      next;
+    }
+    {
+      print; # Print current line
+    }
+    END {
+      if (in_block && !inserted) { # If still in block at EOF and not inserted
+        print entry; # Insert at the very end of the file
+      }
+    }
+  ' "$config_file" > "${config_file}.tmp"
+  mv "${config_file}.tmp" "$config_file"
+}
+
+# New helper function to insert a YAML block (header + first entry) if it's missing
+# This function checks if a YAML block (e.g., 'udpForwarding:') exists.
+# If not, it inserts the block header and the first entry before a specified pattern (e.g., 'quic:').
+insert_yaml_block_if_missing() {
+  local config_file="$1"
+  local block_key="$2" # e.g., "udpForwarding"
+  local new_entry_content="$3" # The multi-line YAML entry to add (e.g., "  - listen:...\n    remote:...")
+  local insert_before_pattern="$4" # Regex pattern for key to insert before, e.g., "tcpForwarding|quic"
+
+  if ! grep -q "^${block_key}:" "$config_file"; then
+    local temp_file=$(mktemp)
+    # The new block includes the header and the first entry
+    local new_block_yaml="${block_key}:\n${new_entry_content}"
+    local inserted_into_temp=false
+
+    # Try to insert before insert_before_pattern
+    awk -v insert_pattern="$insert_before_pattern" -v new_block="$new_block_yaml" '
+      BEGIN { inserted = 0 }
+      $0 ~ insert_pattern && !inserted {
+        print new_block;
+        print ""; # Add a blank line for separation after the new block
+        inserted = 1;
+      }
+      { print }
+    ' "$config_file" > "$temp_file"
+
+    # If the block was not inserted (e.g., insert_before_pattern not found), append to end
+    if [ "$(grep -c "^${block_key}:" "$temp_file")" -eq 0 ]; then
+      echo -e "\n${new_block_yaml}" >> "$temp_file"
+    fi
+    mv "$temp_file" "$config_file"
+    return 0 # Block was inserted
+  fi
+  return 1 # Block already exists
+}
+
+
+# New function to manage client forwarding ports
+manage_client_ports_action() {
+  clear
+  echo ""
+  draw_line "$CYAN" "=" 40
+  echo -e "${CYAN}     ⚙️ Manage Client Ports${RESET}"
+  draw_line "$CYAN" "=" 40
+  echo ""
+
+  local config_dir="$(pwd)/hysteria"
+  # Find all hysteria client config files
+  mapfile -t client_configs < <(find "$config_dir" -maxdepth 1 -type f -name "hysteria-client-*.yaml" -printf "%f\n" | sort)
+
+  if [ ${#client_configs[@]} -eq 0 ]; then
+    print_error "❌ No Hysteria client configuration files found in $config_dir."
+    echo ""
+    echo -e "${YELLOW}Press Enter to return to previous menu...${RESET}"
+    read -p ""
+    return 0
+  fi
+
+  echo -e "${CYAN}📋 Please select a client to manage its ports:${RESET}"
+  client_configs+=("Back to previous menu")
+  select selected_config_file in "${client_configs[@]}"; do
+    if [[ "$selected_config_file" == "Back to previous menu" ]]; then
+      echo -e "${YELLOW}Returning to previous menu...${RESET}"
+      echo ""
+      return 0
+    elif [ -n "$selected_config_file" ]; then
+      break
+    else
+      print_error "Invalid selection. Please enter a valid number."
+    fi
+  done
+  echo ""
+
+  local client_name=$(echo "$selected_config_file" | sed 's/hysteria-client-//' | sed 's/.yaml//')
+  local config_file_path="$config_dir/$selected_config_file"
+  local service_name="hysteria-client-$client_name"
+
+  while true; do
+    clear
+    echo ""
+    draw_line "$CYAN" "=" 40
+    echo -e "${CYAN}     ⚙️ Manage Ports for '$client_name'${RESET}"
+    draw_line "$CYAN" "=" 40
+    echo ""
+
+    echo -e "${CYAN}Current Forwarding Ports:${RESET}"
+    local udp_ports_array=()
+    local tcp_ports_array=()
+
+    # Extract UDP ports using awk for more robust block parsing
+    mapfile -t udp_lines < <(awk '
+      /^udpForwarding:/ {in_block=1; next}
+      /^[^[:space:]]/ {in_block=0} # End of block if new top-level key
+      in_block && /listen:/ {
+        split($0, a, ":")
+        port_num = a[length(a)] # Get the last part after the last colon
+        sub(/^[[:space:]]+/, "", port_num) # Remove leading spaces
+        print port_num
+      }
+    ' "$config_file_path")
+    udp_ports_array=("${udp_lines[@]}")
+
+    echo -e "  ${WHITE}UDP Ports:${RESET}"
+    if [ ${#udp_ports_array[@]} -gt 0 ]; then
+      for port in "${udp_ports_array[@]}"; do
+        echo -e "    - ${YELLOW}$port${RESET}"
+      done
+    else
+      echo -e "    ${RED}(None configured)${RESET}"
+    fi
+
+    # Extract TCP ports using awk
+    mapfile -t tcp_lines < <(awk '
+      /^tcpForwarding:/ {in_block=1; next}
+      /^[^[:space:]]/ {in_block=0} # End of block if new top-level key
+      in_block && /listen:/ {
+        split($0, a, ":")
+        port_num = a[length(a)] # Get the last part after the last colon
+        sub(/^[[:space:]]+/, "", port_num) # Remove leading spaces
+        print port_num
+      }
+    ' "$config_file_path")
+    tcp_ports_array=("${tcp_lines[@]}")
+
+    echo -e "  ${WHITE}TCP Ports:${RESET}"
+    if [ ${#tcp_ports_array[@]} -gt 0 ]; then
+      for port in "${tcp_ports_array[@]}"; do
+        echo -e "    - ${YELLOW}$port${RESET}"
+      done
+    else
+      echo -e "    ${RED}(None configured)${RESET}"
+    fi
+    echo ""
+
+    echo "Select an action:"
+    echo -e "  ${YELLOW}1)${RESET} ${WHITE}Reset and add new ports${RESET}" # New option
+    echo -e "  ${YELLOW}2)${RESET} ${WHITE}Back to client management menu${RESET}" # Adjusted number
+    echo ""
+    read -p "👉 Your choice: " port_manage_choice
+    echo ""
+
+    case $port_manage_choice in
+      1) # Reset and add new ports
+        local new_ports_input
+        while true; do
+          echo -e "👉 ${WHITE}Enter new forwarding ports separated by commas (e.g., 43070,53875):${RESET} "
+          read -p "" new_ports_input
+          if [[ -n "$new_ports_input" ]]; then
+            local invalid_port_found=false
+            IFS=',' read -ra ADDR <<< "$new_ports_input"
+            for p in "${ADDR[@]}"; do
+              if ! validate_port "$p"; then
+                print_error "Invalid port found: $p. Please enter valid ports between 1 and 65535."
+                invalid_port_found=true
+                break
+              fi
+            done
+            if [ "$invalid_port_found" = false ]; then
+              break
+            fi
+          else
+            print_error "Forwarding ports cannot be empty!"
+          fi
+        done
+        echo ""
+
+        local new_protocol_choice
+        echo -e "${CYAN}Select protocol for new ports:${RESET}"
+        echo -e "  ${YELLOW}1)${RESET} ${WHITE}UDP${RESET}"
+        echo -e "  ${YELLOW}2)${RESET} ${WHITE}TCP${RESET}"
+        echo -e "  ${YELLOW}3)${RESET} ${WHITE}Both${RESET}"
+        read -p "👉 Your choice (1-3): " new_protocol_choice
+        echo ""
+
+        local temp_file=$(mktemp)
+        cp "$config_file_path" "$temp_file"
+
+        # Remove existing udpForwarding and tcpForwarding blocks
+        # This sed command deletes lines from 'udpForwarding:' until the next top-level key or end of file.
+        # It handles cases where the block might be at the end of the file.
+        sed -i '/^udpForwarding:/,/^[[:alnum:]]/ { /^udpForwarding:/! { /^[[:alnum:]]/!d; }; }' "$temp_file"
+        sed -i '/^tcpForwarding:/,/^[[:alnum:]]/ { /^tcpForwarding:/! { /^[[:alnum:]]/!d; }; }' "$temp_file"
+        # The above sed commands are a bit complex to handle the end of file case.
+        # A simpler approach for deletion might be:
+        # sed -i '/^udpForwarding:/,${/^[[:alnum:]]/!d}' "$temp_file" # Deletes from udpForwarding to EOF
+        # sed -i '/^tcpForwarding:/,${/^[[:alnum:]]/!d}' "$temp_file" # Deletes from tcpForwarding to EOF
+        # This is more aggressive and might delete other blocks if they are after.
+        # Let's use a safer approach to delete the block and its content.
+
+        # A more robust way to delete a YAML block:
+        # Use awk to print lines, skipping the target block.
+        awk -v block1="udpForwarding" -v block2="tcpForwarding" '
+          BEGIN { skip = 0 }
+          $0 ~ "^" block1 ":" { skip = 1; next }
+          $0 ~ "^" block2 ":" { skip = 1; next }
+          skip == 1 && /^[[:alnum:]]/ { skip = 0 } # Stop skipping if a new top-level key is found
+          skip == 0 { print }
+        ' "$temp_file" > "${temp_file}.cleaned"
+        mv "${temp_file}.cleaned" "$temp_file"
+
+        local udp_new_content=""
+        local tcp_new_content=""
+
+        # Generate new UDP forwarding content
+        if [[ "$new_protocol_choice" == "1" || "$new_protocol_choice" == "3" ]]; then
+          IFS=',' read -ra ADDR <<< "$new_ports_input"
+          for p in "${ADDR[@]}"; do
+            udp_new_content+="  - listen: 0.0.0.0:$p\n    remote: '[::]:$p'\n    timeout: 20s\n"
+          done
+          udp_new_content="udpForwarding:\n${udp_new_content}"
+        fi
+
+        # Generate new TCP forwarding content
+        if [[ "$new_protocol_choice" == "2" || "$new_protocol_choice" == "3" ]]; then
+          IFS=',' read -ra ADDR <<< "$new_ports_input"
+          for p in "${ADDR[@]}"; do
+            tcp_new_content+="  - listen: 0.0.0.0:$p\n    remote: '[::]:$p'\n    timeout: 20s\n"
+          done
+          tcp_new_content="tcpForwarding:\n${tcp_new_content}"
+        fi
+
+        local insert_point=$(grep -n "^quic:" "$temp_file" | head -n 1 | cut -d: -f1)
+        if [[ -z "$insert_point" ]]; then
+            # If 'quic:' block not found, append to the end
+            if [[ -n "$udp_new_content" ]]; then
+                echo -e "\n${udp_new_content}" >> "$temp_file"
+            fi
+            if [[ -n "$tcp_new_content" ]]; then
+                echo -e "\n${tcp_new_content}" >> "$temp_file"
+            fi
+        else
+            # Insert before 'quic:' block
+            local insert_line_num=$((insert_point - 1))
+            if [[ -n "$tcp_new_content" ]]; then
+                sed -i "${insert_line_num}i\\
+${tcp_new_content}" "$temp_file"
+                insert_line_num=$((insert_line_num)) # Adjust if UDP is also inserted
+            fi
+            if [[ -n "$udp_new_content" ]]; then
+                sed -i "${insert_line_num}i\\
+${udp_new_content}" "$temp_file"
+            fi
+        fi
+
+        mv "$temp_file" "$config_file_path"
+        print_success "Ports reset and added successfully."
+        echo -e "${CYAN}Restarting Hysteria client '$client_name' to apply changes...${RESET}"
+        sudo systemctl restart "$service_name" > /dev/null 2>&1
+        print_success "Client service restarted."
+        ;;
+      2) # Back to client management menu (adjusted number)
+        echo -e "${YELLOW}Returning to client management menu...${RESET}"
+        break
+        ;;
+      *)
+        echo -e "${RED}❌ Invalid option.${RESET}"
+        ;;
+    esac
+    echo ""
+    echo -e "${YELLOW}Press Enter to continue...${RESET}"
+    read -p ""
+  done
 }
 
 
@@ -1833,8 +2133,9 @@ while true; do
               echo -e "  ${YELLOW}3)${RESET} ${WHITE}Delete a Hysteria client${RESET}"
               echo -e "  ${YELLOW}4)${RESET} ${BLUE}Schedule Hysteria client restart${RESET}"
               echo -e "  ${YELLOW}5)${RESET} ${RED}Delete scheduled restart${RESET}"
-              echo -e "  ${YELLOW}6)${RESET} ${WHITE}Speedtest from server${RESET}" # New option
-              echo -e "  ${YELLOW}7)${RESET} ${WHITE}Back to previous menu${RESET}" # Adjusted number
+              echo -e "  ${YELLOW}6)${RESET} ${WHITE}Speedtest from server${RESET}"
+              echo -e "  ${YELLOW}7)${RESET} ${WHITE}Manage Client Ports${RESET}" # New option
+              echo -e "  ${YELLOW}8)${RESET} ${WHITE}Back to previous menu${RESET}" # Adjusted number
               echo ""
               draw_line "$CYAN" "-" 40
               echo -e "👉 ${CYAN}Your choice:${RESET} "
@@ -1964,14 +2265,17 @@ while true; do
                 6) # New Speedtest option
                   speedtest_from_server_action
                   ;;
-                7) # Adjusted number for Back to previous menu
+                7) # Manage Client Ports
+                  manage_client_ports_action
+                  ;;
+                8) # Adjusted number for Back to previous menu
                   echo -e "${YELLOW}Returning to previous menu...${RESET}"
                   break # Break out of this while loop to return to Hysteria Tunnel Management
                   ;;
                 *)
                   echo -e "${RED}❌ Invalid option.${RESET}"
                   echo ""
-                  echo -e "${YELLOW}Press Enter to continue...${RESET}"
+                  echo -e "${YELLOW}Press Press Enter to continue...${RESET}"
                   read -p ""
                   ;;
               esac
@@ -2008,4 +2312,3 @@ while true; do
   esac
   echo ""
 done
-# Removed the else block for Rust readiness as it's no longer a prerequisite for this script.
